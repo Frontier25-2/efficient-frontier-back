@@ -13,7 +13,7 @@ from .services.price_service import fetch_price_history
 from .services.return_service import build_returns_dataframe
 
 # ===== 포트폴리오 최적화 모델 =====
-from models.quant_model_modules import (
+from app.models.quant_model_modules import (
     compute_min_variance,
     compute_max_sharpe,
     compute_risk_parity,        

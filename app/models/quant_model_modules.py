@@ -453,7 +453,10 @@ def compute_target_risk(
     """
     target_ratio: 0~1 슬라이더 위치
     """
-
+    if isinstance(returns, np.ndarray): 
+            # 임시 컬럼명 부여 (frontier.py에서 수정했다면 이 조건문엔 안 걸림)
+        returns = pd.DataFrame(returns)
+        
     returns = _clean_returns_df(returns)
     if returns.empty or returns.shape[1] == 0:
         return np.array([]), float("nan"), float("nan")
@@ -528,9 +531,11 @@ def compute_target_risk(
         else:
             w = res.x
 
-    except Exception:
+    except Exception as e:
+        # [수정] 에러 내용을 출력하여 원인 파악 (운영 환경에서는 logging 사용 권장)
+        print(f"Optimization Error with target {target_ratio}: {e}", flush=True)
         w = w0
-
+    
     w = clean_weights_array(w)
 
     port_var = float(w @ cov @ w)
@@ -583,3 +588,82 @@ def compute_efficient_frontier(df, n_points=40):
 
     print("=== [EF] END efficient frontier ===\n", flush=True)
     return risks, returns, weights_list
+
+def compute_frontier_markers(df: pd.DataFrame, annual_freq: int = 252):
+    """
+    효율적 프론티어 그래프에 표시할 4가지 핵심 포트폴리오 좌표 계산
+    1. GMV (Global Minimum Variance): 최소 분산
+    2. MST (Max Sharpe Tangency): 최대 샤프 지수
+    3. RP (Risk Parity): 리스크 패리티
+    4. MDP (Max Diversification): 최대 분산 효과
+    """
+    from pypfopt.efficient_frontier import EfficientFrontier
+    from pypfopt import risk_models, expected_returns
+    
+    results = {}
+    
+    # 데이터 전처리
+    df = _clean_returns_df(df)
+    if df.empty:
+        return {}
+
+    # 기대수익률(mu)과 공분산행렬(S) 계산
+    mu = expected_returns.mean_historical_return(df, returns_data=True, compounding=True, frequency=annual_freq)
+    S = risk_models.sample_cov(df, returns_data=True, frequency=annual_freq)
+
+    # --- 1. 최소 분산 (Min Volatility) ---
+    try:
+        ef = EfficientFrontier(mu, S)
+        ef.min_volatility()
+        w_gmv = clean_weights_array(_weights_dict_to_array(ef.clean_weights(), df.columns))
+        r_gmv, ret_gmv = _compute_portfolio_stats(df, w_gmv, annual_freq)
+        results['min_volatility'] = {"risk": r_gmv, "return": ret_gmv, "weights": w_gmv.tolist()}
+    except Exception as e:
+        print(f"MinVol Error: {e}")
+        results['min_volatility'] = None
+
+    # --- 2. 최대 샤프 (Max Sharpe) ---
+    try:
+        # risk_free_rate는 0.02(2%) 혹은 0으로 가정
+        ef = EfficientFrontier(mu, S)
+        ef.max_sharpe(risk_free_rate=0.0) 
+        w_mst = clean_weights_array(_weights_dict_to_array(ef.clean_weights(), df.columns))
+        r_mst, ret_mst = _compute_portfolio_stats(df, w_mst, annual_freq)
+        results['max_sharpe'] = {"risk": r_mst, "return": ret_mst, "weights": w_mst.tolist()}
+    except Exception as e:
+        print(f"MaxSharpe Error: {e}")
+        results['max_sharpe'] = None
+
+    # --- 3. 리스크 패리티 (Risk Parity) ---
+    try:
+        w_rp, r_rp, ret_rp = compute_risk_parity(df, annual_freq)
+        results['risk_parity'] = {"risk": r_rp, "return": ret_rp, "weights": w_rp.tolist()}
+    except Exception as e:
+        print(f"RP Error: {e}")
+        results['risk_parity'] = None
+
+    # --- 4. 최대 분산 비율 (Max Diversification) ---
+    try:
+        # MDP 목적함수: - (가중평균 개별 변동성 / 포트폴리오 변동성)
+        vol = np.sqrt(np.diag(S)) # 개별 자산 변동성
+        
+        def calc_div_ratio(w):
+            w = np.array(w)
+            w_vol = np.dot(vol, w) # 분자: 개별 리스크의 합
+            port_vol = np.sqrt(w.T @ S @ w) # 분모: 포트폴리오 리스크
+            return -(w_vol / port_vol)
+
+        cons = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0, 1) for _ in range(len(df.columns)))
+        w0 = np.array([1/len(df.columns)] * len(df.columns))
+        
+        res = minimize(calc_div_ratio, w0, method='SLSQP', bounds=bounds, constraints=cons)
+        w_mdp = clean_weights_array(res.x)
+        r_mdp, ret_mdp = _compute_portfolio_stats(df, w_mdp, annual_freq)
+        
+        results['max_diversification'] = {"risk": r_mdp, "return": ret_mdp, "weights": w_mdp.tolist()}
+    except Exception as e:
+        print(f"MDP Error: {e}")
+        results['max_diversification'] = None
+
+    return results
